@@ -64,7 +64,36 @@ PPE 出口用 `mtk_foe_entry_set_vlan(ctrl)` 下发。技术上可行（flint4 �
 三个独立实现（上游 6.19+ 的 mxl862、bpi r4 pro 适配、GL.iNet MT5000 PR）收敛到同一条路，
 说明这是该问题的"正解"。
 
-## 4. x-wrt 侧现状（关键）
+## 4. x-wrt 的转发模型：为什么"短 tag"就够了
+
+x-wrt 与官方 OpenWrt 的行为差异是理解整个方案的钥匙：
+
+**x-wrt 故意屏蔽交换机自身的 bridge/offload，LAN 侧全部流量上 CPU 走 natflow。**
+具体三段式：
+
+1. **入方向**：交换机不做转发决策，只按管理 tag 把帧送上 CPU（port isolation 保证用户口只通 CPU 口）
+2. **转发决策**：CPU 上的软件 bridge + natflow 决定每条流的出口
+3. **出方向**：PPE 绑定流后，只需替硬件插入一个 **4 字节短 tag**（形态类似 MTK SDK 的
+   special tag）——交换机按短 tag 里的端口/VLAN 信息把帧送到目的口，
+   即 **Port → PPE → Port 硬转**
+
+这个模型下对交换机 tag 的要求只有两条：**① PPE 硬件发得出（4 字节、802.1Q 形状）
+② 交换机解得出**。
+
+- `MXL862_8021Q`（bpi r4 pro）：管理 VID 编码在标准 802.1Q TCI 里 ✅
+- `YT922X_4B`（flint4/GL-BE14000）：4 字节 802.1Q 形状 + 端口 ctrl ✅
+- `RTL8366UB_8021Q`（MT5000，本方案）：tag_8021q 框架，同款短 tag ✅
+
+**bpi r4 pro 是 MTK 官方推荐开发板**，其 mxl862 + 8021Q tagger 就是这套
+"外部交换机 + PPE 加速"模型的 MTK 体系内参照实现——对齐它，等于对齐 MTK SDK 的思路，
+这也是该方案社区/上游接受度最高的原因。
+
+同时注意：因为 LAN↔LAN 也全过 CPU，**MT5000 的 LAN-LAN 吞吐同样依赖 PPE 生效**
+（交换机内直转被 isolation 屏蔽）。验证时 LAN-LAN 必须和三证据一起看，
+参照 flint4 实测：修复前 hwnat=1 时 0.09~0.15 Gbit/s（近断流），修复后 2.32~2.34 Gbit/s、
+CPU 从 ~33% 降到 ~5%。
+
+## 5. x-wrt PPE1 现状（关键）
 
 x-wrt 用自己的 natflow 硬件加速栈，替换了 MediaTek 驱动的 PPE 实现：
 
@@ -89,15 +118,15 @@ VID 编码（`net/dsa/tag_8021q.c`）：RSV=0xC00（bits10-11 恒为 11），
 standalone vid = `0xC00 | switch_id<<6 | port`，bridge vid = `0xC00 | VBID(1..7)`，
 低 10 位足够编码 → 复用 MXL 的 `(vid & 0x3ff) << 5 | port` 打包方案没有位数问题。
 
-## 5. 结论
+## 6. 结论
 
 **可以用同样的方式，且工作量小于 flint4 适配：**
 
 1. 不需要自定义私有 4 字节 tag（方案 B 放弃）——用 tag_8021q 框架，与 bpi r4 pro / 上游收敛一致；
 2. x-wrt PPE1 已有 MXL862_8021Q 同构路径，扩展点明确、改动小（两个 case + 一个分支条件）；
 3. 协议号 32 在 x-wrt 已被刻意保留；
-4. RTL8366UB 驱动本身做了 port isolation（user 口只通 CPU 口），
-   所有 LAN 流量天然经 CPU → **LAN↔LAN 也能被 PPE 接管**
+4. RTL8366UB 驱动本身做了 port isolation（user 口只通 CPU 口），与 x-wrt
+   "全部流量走 natflow" 的模型天然吻合 → **LAN↔LAN 也能被 PPE 接管**
    （Port→PPE→Port 硬转，正是 x-wrt 关掉交换机 offload 想要的效果）；
 5. 必须绕开的坑：PR 的 `mtk_ppe_offload.c` 改动是死代码，要按 flint4 的方法论
    重放到 995 补丁的 PPE1 + user.c 里，并以 `mtk_ppe_offload1.o` 产物和三证据验证为准。
